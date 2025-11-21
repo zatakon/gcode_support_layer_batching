@@ -23,6 +23,7 @@ class GCodeCommand:
     f: Optional[float] = None
     tool: Optional[int] = None
     comment: Optional[str] = None
+    is_tool_change_sequence: bool = False  # Marks commands part of tool change
 
 
 @dataclass
@@ -33,6 +34,7 @@ class Layer:
     commands: List[GCodeCommand] = field(default_factory=list)
     tool: Optional[int] = None
     bounds: Optional[Tuple[float, float, float, float]] = None  # (min_x, min_y, max_x, max_y)
+    tool_change_commands: List[GCodeCommand] = field(default_factory=list)  # Commands for tool change before this layer
     
     def calculate_bounds(self) -> Tuple[float, float, float, float]:
         """Calculate the bounding box of this layer."""
@@ -53,6 +55,8 @@ class GCodeParser:
         self.layers: List[Layer] = []
         self.current_tool: Optional[int] = None
         self.current_position = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'e': 0.0}
+        self.pending_tool_change_commands: List[GCodeCommand] = []
+        self.in_tool_change_sequence: bool = False
         
     def parse_file(self, filepath: str) -> List[Layer]:
         """Parse a G-code file and return a list of layers."""
@@ -69,18 +73,52 @@ class GCodeParser:
         
         for line_num, line in enumerate(lines):
             line = line.strip()
-            if not line or line.startswith(';'):
+            if not line:
+                continue
+            
+            # Check for layer markers in comments (e.g., OrcaSlicer format)
+            if line.startswith(';'):
+                if 'layer num/total_layer_count:' in line.lower():
+                    # Extract layer number from comment
+                    match = re.search(r'layer num/total_layer_count:\s*(\d+)/(\d+)', line, re.IGNORECASE)
+                    if match:
+                        # Save current layer if it exists
+                        if current_layer is not None:
+                            current_layer.calculate_bounds()
+                            self.layers.append(current_layer)
+                        
+                        # Start new layer
+                        layer_number = int(match.group(1))
+                        current_layer = Layer(
+                            layer_number=layer_number,
+                            z_height=current_z if current_z is not None else 0.0,
+                            tool=self.current_tool,
+                            tool_change_commands=self.pending_tool_change_commands.copy()
+                        )
+                        # Clear pending tool change commands and end sequence
+                        self.pending_tool_change_commands.clear()
+                        self.in_tool_change_sequence = False
                 continue
             
             cmd = self._parse_command(line_num, line)
             
-            # Track tool changes
+            # Track tool changes (only T0-T9, ignore special commands like T1000)
             if cmd.command and cmd.command.startswith('T'):
                 try:
-                    self.current_tool = int(cmd.command[1:])
-                    cmd.tool = self.current_tool
+                    tool_num = int(cmd.command[1:])
+                    # Only accept tool numbers 0-9 (standard extruders)
+                    if 0 <= tool_num <= 9:
+                        self.current_tool = tool_num
+                        cmd.tool = self.current_tool
+                        cmd.is_tool_change_sequence = True
+                        self.in_tool_change_sequence = True
                 except ValueError:
                     pass
+            
+            # Capture tool change sequence commands
+            if self.in_tool_change_sequence:
+                cmd.is_tool_change_sequence = True
+                self.pending_tool_change_commands.append(cmd)
             
             # Track position
             if cmd.x is not None:
@@ -89,23 +127,14 @@ class GCodeParser:
                 self.current_position['y'] = cmd.y
             if cmd.z is not None:
                 self.current_position['z'] = cmd.z
+                # Update current Z height for layer tracking
+                if cmd.z > (current_z or 0):
+                    current_z = cmd.z
+                    # Update current layer's z_height if layer exists
+                    if current_layer is not None:
+                        current_layer.z_height = current_z
             if cmd.e is not None:
                 self.current_position['e'] = cmd.e
-            
-            # Detect layer changes (Z movement)
-            if cmd.z is not None and (current_z is None or cmd.z > current_z):
-                # New layer detected
-                if current_layer is not None:
-                    current_layer.calculate_bounds()
-                    self.layers.append(current_layer)
-                
-                current_z = cmd.z
-                layer_number += 1
-                current_layer = Layer(
-                    layer_number=layer_number,
-                    z_height=current_z,
-                    tool=self.current_tool
-                )
             
             # Add command to current layer
             if current_layer is not None:

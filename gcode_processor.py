@@ -132,9 +132,16 @@ class GCodeProcessor:
                         f"Layers {batch.start_layer}-{batch.end_layer} "
                         f"({batch.layer_count()} layers)\n")
             
-            # Tool change if needed
-            if current_tool != batch.tool:
-                output.write(f"T{batch.tool} ; switch to tool {batch.tool}\n")
+            # Tool change if needed - use the first layer's tool change sequence
+            if current_tool != batch.tool and batch.layers:
+                first_layer = batch.layers[0]
+                if first_layer.tool_change_commands:
+                    output.write(f"; === Tool change to T{batch.tool} ===\n")
+                    for cmd in first_layer.tool_change_commands:
+                        output.write(f"{cmd.raw_line}\n")
+                else:
+                    # Fallback to simple tool change
+                    output.write(f"T{batch.tool} ; switch to tool {batch.tool}\n")
                 current_tool = batch.tool
             
             # Process each layer in the batch
