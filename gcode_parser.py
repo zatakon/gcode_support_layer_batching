@@ -108,17 +108,14 @@ class GCodeParser:
                     self.header_lines.append(original_line)
                 continue
             
-            # Check for layer markers - this marks the end of header
+            # Check for layer markers in comments (e.g., OrcaSlicer format)
             if line.startswith(';') and 'layer num/total_layer_count:' in line.lower():
-                in_header = False
-                # This is a layer marker, process it below
-            
-            # Capture header and config blocks (everything before first layer marker)
-            if in_header:
-                self.header_lines.append(original_line)
-                continue              # Check for layer markers in comments (e.g., OrcaSlicer format)
-            if line.startswith(';'):
-                if 'layer num/total_layer_count:' in line.lower():
+                # Layer markers have format: "; layer num/total_layer_count: 1/128"
+                # Config lines have format: "; layer_change_gcode = ... layer num/total_layer_count: ..."
+                # Only treat as layer marker if it's a direct comment (not a config value with '=')
+                if '=' not in line or line.index(':') < line.index('='):
+                    # This is an actual layer marker - stop capturing header
+                    in_header = False
                     # Extract layer number from comment
                     match = re.search(r'layer num/total_layer_count:\s*(\d+)/(\d+)', line, re.IGNORECASE)
                     if match:
@@ -138,19 +135,11 @@ class GCodeParser:
                         # Clear pending tool change commands and end sequence
                         self.pending_tool_change_commands.clear()
                         self.in_tool_change_sequence = False
-                
-                # Create a comment-only command for all comment lines
-                comment_cmd = GCodeCommand(
-                    line_number=line_num,
-                    raw_line=line,
-                    command='',
-                    comment=line[1:].strip()  # Remove leading ; and strip whitespace
-                )
-                
-                # Add to current layer if it exists
-                if current_layer is not None:
-                    current_layer.commands.append(comment_cmd)
-                
+                    continue
+            
+            # Capture header and config blocks (everything before first layer marker)
+            if in_header:
+                self.header_lines.append(original_line)
                 continue
             
             cmd = self._parse_command(line_num, line)
