@@ -153,8 +153,7 @@ class SimpleGCodeProcessor:
                 else:
                     output.write(f"T{batch.tool} ; switch to tool {batch.tool}\n")
                 current_tool = batch.tool
-            
-            # Write each object layer in batch
+              # Write each object layer in batch
             for obj_layer in batch.object_layers:
                 output.write(f"; Object segment: Layer {obj_layer.layer_number} at Z={obj_layer.z_height:.3f}\n")
                 
@@ -167,7 +166,11 @@ class SimpleGCodeProcessor:
                     if cmd.z is not None:
                         self.current_position['z'] = cmd.z
                     
-                    output.write(f"{cmd.raw_line}\n")
+                    # Handle comment-only lines (command is empty, only comment exists)
+                    if cmd.command == '' and cmd.comment:
+                        output.write(f"; {cmd.comment}\n")
+                    else:
+                        output.write(f"{cmd.raw_line}\n")
             
             output.write("\n")
         
