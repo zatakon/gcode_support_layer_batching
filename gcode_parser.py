@@ -27,17 +27,16 @@ class GCodeCommand:
 
 
 @dataclass
-class Layer:
-    """Represents a single print layer."""
-    layer_number: int
-    z_height: float
-    commands: List[GCodeCommand] = field(default_factory=list)
+class ObjectSegment:
+    """Represents a segment of one object within a layer."""
+    object_id: Optional[str] = None  # Object label id from M624 command
     tool: Optional[int] = None
-    bounds: Optional[Tuple[float, float, float, float]] = None  # (min_x, min_y, max_x, max_y)
-    tool_change_commands: List[GCodeCommand] = field(default_factory=list)  # Commands for tool change before this layer
+    commands: List[GCodeCommand] = field(default_factory=list)
+    tool_change_commands: List[GCodeCommand] = field(default_factory=list)
+    bounds: Optional[Tuple[float, float, float, float]] = None
     
     def calculate_bounds(self) -> Tuple[float, float, float, float]:
-        """Calculate the bounding box of this layer."""
+        """Calculate the bounding box of this segment."""
         x_coords = [cmd.x for cmd in self.commands if cmd.x is not None]
         y_coords = [cmd.y for cmd in self.commands if cmd.y is not None]
         
@@ -45,6 +44,34 @@ class Layer:
             return (0, 0, 0, 0)
         
         self.bounds = (min(x_coords), min(y_coords), max(x_coords), max(y_coords))
+        return self.bounds
+
+
+@dataclass
+class Layer:
+    """Represents a single print layer, potentially containing multiple objects."""
+    layer_number: int
+    z_height: float
+    segments: List[ObjectSegment] = field(default_factory=list)  # Multiple objects in this layer
+    commands: List[GCodeCommand] = field(default_factory=list)  # Layer-level commands (deprecated, use segments)
+    tool: Optional[int] = None  # Deprecated, use segments instead
+    bounds: Optional[Tuple[float, float, float, float]] = None
+    tool_change_commands: List[GCodeCommand] = field(default_factory=list)
+    
+    def calculate_bounds(self) -> Tuple[float, float, float, float]:
+        """Calculate the bounding box of this layer (all segments)."""
+        all_x = []
+        all_y = []
+        for segment in self.segments:
+            x_coords = [cmd.x for cmd in segment.commands if cmd.x is not None]
+            y_coords = [cmd.y for cmd in segment.commands if cmd.y is not None]
+            all_x.extend(x_coords)
+            all_y.extend(y_coords)
+        
+        if not all_x or not all_y:
+            return (0, 0, 0, 0)
+        
+        self.bounds = (min(all_x), min(all_y), max(all_x), max(all_y))
         return self.bounds
 
 
@@ -57,7 +84,8 @@ class GCodeParser:
         self.current_position = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'e': 0.0}
         self.pending_tool_change_commands: List[GCodeCommand] = []
         self.in_tool_change_sequence: bool = False
-        
+        self.header_lines: List[str] = []  # Store header and config blocks
+    
     def parse_file(self, filepath: str) -> List[Layer]:
         """Parse a G-code file and return a list of layers."""
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -70,13 +98,26 @@ class GCodeParser:
         current_layer: Optional[Layer] = None
         current_z: Optional[float] = None
         layer_number = 0
+        in_header = True
         
         for line_num, line in enumerate(lines):
+            original_line = line
             line = line.strip()
             if not line:
+                if in_header:
+                    self.header_lines.append(original_line)
                 continue
             
-            # Check for layer markers in comments (e.g., OrcaSlicer format)
+            # Check for layer markers - this marks the end of header
+            if line.startswith(';') and 'layer num/total_layer_count:' in line.lower():
+                in_header = False
+                # This is a layer marker, process it below
+            
+            # Capture header and config blocks (everything before first layer marker)
+            if in_header:
+                self.header_lines.append(original_line)
+                continue
+              # Check for layer markers in comments (e.g., OrcaSlicer format)
             if line.startswith(';'):
                 if 'layer num/total_layer_count:' in line.lower():
                     # Extract layer number from comment
@@ -92,7 +133,7 @@ class GCodeParser:
                         current_layer = Layer(
                             layer_number=layer_number,
                             z_height=current_z if current_z is not None else 0.0,
-                            tool=self.current_tool,
+                            tool=self.current_tool if self.current_tool is not None else 0,
                             tool_change_commands=self.pending_tool_change_commands.copy()
                         )
                         # Clear pending tool change commands and end sequence
