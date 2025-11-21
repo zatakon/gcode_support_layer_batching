@@ -24,8 +24,7 @@ def parse_gcode_objects(input_file):
         lines = f.readlines()
     
     print(f"  Read {len(lines)} lines")
-    
-    # Find first layer
+      # Find first layer
     preamble_end = 0
     for i, line in enumerate(lines):
         if '; layer num/total_layer_count: 1/' in line:
@@ -53,13 +52,16 @@ def parse_gcode_objects(input_file):
                 objects_by_layer[current_layer_num] = []
             continue
         
-        # Detect tool change
-        tool_match = re.match(r'^T([01])$', line.strip())
-        if tool_match:
-            current_tool = line.strip()
+        # Detect tool change start (M620 S...A)
+        if re.match(r'^M620 S[01]A', line.strip()):
             in_tool_change = True
         
-        # Skip tool change sequences
+        # Detect tool command within tool change sequence
+        tool_match = re.match(r'^T([01])$', line.strip())
+        if tool_match and in_tool_change:
+            current_tool = line.strip()
+        
+        # Skip tool change sequences until M621
         if in_tool_change:
             if 'M621 S' in line and 'A' in line:
                 in_tool_change = False
@@ -91,24 +93,45 @@ def parse_gcode_objects(input_file):
     return preamble, objects_by_layer
 
 
-def generate_tool_change(from_tool, to_tool):
-    """Generate simplified tool change sequence"""
+def generate_tool_change(from_tool, to_tool, current_z=None):
+    """Generate tool change G-code sequence.
+    
+    Args:
+        from_tool: Source tool (e.g., 'T0')
+        to_tool: Destination tool (e.g., 'T1')  
+        current_z: Current Z height for proper lifting (optional)
+    """
     tool_num = '0' if to_tool == 'T0' else '1'
-    return [
+    
+    # Full tool change with filament cutting and purging (based on filament_change.txt reference)
+    lines = [
         f"\n; ===== Tool change: {from_tool} -> {to_tool} =====\n",
-        f"M620 S{tool_num}A\n",
+        f"M620 S{tool_num}A\n",  # Start tool change sequence
         "M204 S9000\n",
-        "G17\n",
-        "G2 Z0.6 I0.86 J0.86 P1 F10000\n",
-        "G1 Z3.2 F1200\n",
+    ]
+    
+    # Add Z lift if we have current Z info
+    if current_z is not None:
+        lift_z = current_z + 3.0
+        lines.extend([
+            "\n",
+            "G1 Z{:.1f} F1200\n".format(lift_z),
+            "\n",
+        ])
+    
+    lines.extend([
         "G1 X70 F21000\n",
         "G1 Y245\n",
         "G1 Y265 F3000\n",
         "M400\n",
         "M106 P1 S0\n",
         "M106 P2 S0\n",
+        "\n",
         "M104 S220\n",
+        "\n",
+        "\n",
         "M620.11 S0\n",
+        "\n",
         "M400\n",
         "G1 X90\n",
         "G1 Y255 F4000\n",
@@ -116,21 +139,56 @@ def generate_tool_change(from_tool, to_tool):
         "G1 X120 F15000\n",
         "G1 X20 Y50 F21000\n",
         "G1 Y-3\n",
+        "\n",
         "M620.1 E F299 T240\n",
         f"{to_tool}\n",
         "M620.1 E F299 T240\n",
+        "\n",
+        "\n",
+        "\n",
         "M620.11 S0\n",
+        "\n",
         "G92 E0\n",
+        "\n",
+        "M83\n",
+        "; FLUSH_START\n",
+        "; always use highest temperature to flush\n",
+        "M400\n",
+        "\n",
+        "M109 S240\n",
+        "\n",
+        "\n",
+        "G1 E23.7 F299 ; do not need pulsatile flushing for start part\n",
+        "G1 E0.668486 F50\n",
+        "G1 E7.68759 F299\n",
+        "G1 E0.668486 F50\n",
+        "G1 E7.68759 F299\n",
+        "G1 E0.668486 F50\n",
+        "G1 E7.68759 F299\n",
+        "G1 E0.668486 F50\n",
+        "G1 E7.68759 F299\n",
+        "\n",
+        "; FLUSH_END\n",
+        "G1 E-2 F1800\n",
+        "G1 E2 F300\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
         "; FLUSH_START\n",
         "M400\n",
         "M109 S220\n",
-        "G1 E2 F299\n",
+        "G1 E2 F299 ;Compensate for filament spillage during waiting temperature\n",
         "; FLUSH_END\n",
         "M400\n",
         "G92 E0\n",
         "G1 E-2 F1800\n",
         "M106 P1 S255\n",
         "M400 S3\n",
+        "\n",
         "G1 X70 F5000\n",
         "G1 X90 F3000\n",
         "G1 Y255 F4000\n",
@@ -140,23 +198,36 @@ def generate_tool_change(from_tool, to_tool):
         "G1 X100 F5000\n",
         "G1 X70 F10000\n",
         "G1 X100 F5000\n",
+        "\n",
         "G1 X70 F10000\n",
         "G1 X80 F15000\n",
         "G1 X60\n",
         "G1 X80\n",
         "G1 X60\n",
-        "G1 X80\n",
+        "G1 X80 ; shake to put down garbage\n",
         "G1 X100 F5000\n",
-        "G1 X165 F15000\n",
-        "G1 Y256\n",
+        "G1 X165 F15000; wipe and shake\n",
+        "G1 Y256 ; move Y to aside, prevent collision\n",
         "M400\n",
-        "G1 Z3.2 F3000\n",
+    ])
+    
+    # Return to proper Z height if we have it
+    if current_z is not None:
+        lines.append("G1 Z{:.1f} F3000\n".format(lift_z))
+    
+    lines.extend([
+        "\n",
         "M204 S10000\n",
+        "\n",
+        "\n",
         f"M621 S{tool_num}A\n",
-        "M106 S0\n",
-        "M104 S220\n",
-        "M900 K0.015 L1000 M10\n",
-    ]
+        "M106 S255\n",
+        "M104 S220 ; set nozzle temperature\n",
+        "; Filament gcode\n",
+        "M900 K0.015 L1000 M10 ; Override pressure advance value\n",
+    ])
+    
+    return lines
 
 
 def reorganize_by_batches(objects_by_layer, batch_size=5):
@@ -168,12 +239,12 @@ def reorganize_by_batches(objects_by_layer, batch_size=5):
     print(f"\nReorganizing into {num_batches} batches...")
     
     current_tool = 'T0'
+    last_batch_tool = None  # Track which tool was used in the previous batch
     
     for batch_idx in range(num_batches):
         start_layer = batch_idx * batch_size + 1
         end_layer = min((batch_idx + 1) * batch_size, max_layer)
-        
-        # Alternate tool order
+          # Alternate tool order
         if batch_idx % 2 == 0:
             tool_order = ['T0', 'T1']
         else:
@@ -187,6 +258,9 @@ def reorganize_by_batches(objects_by_layer, batch_size=5):
                 print(f"  Tool change: {current_tool} -> {tool}")
                 output_lines.extend(generate_tool_change(current_tool, tool))
                 current_tool = tool
+            else:
+                # Same tool - no tool change needed, just continue printing
+                print(f"  Continue with {tool} (no tool change)")
             
             # Print all objects of this tool
             objects_printed = 0
@@ -198,6 +272,7 @@ def reorganize_by_batches(objects_by_layer, batch_size=5):
                             objects_printed += 1
             
             print(f"  {tool}: {objects_printed} objects")
+            last_batch_tool = tool  # Remember which tool we're ending this part with
     
     return output_lines
 
