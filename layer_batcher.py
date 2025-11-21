@@ -39,7 +39,7 @@ class LayerBatcher:
         
         Args:
             collision_detector: Collision detector instance
-            max_batch_layers: Maximum number of layers to batch together
+            max_batch_layers: Maximum number of ACTUAL layers (not parser layers) to batch
         """
         self.collision_detector = collision_detector
         self.max_batch_layers = max_batch_layers
@@ -48,17 +48,21 @@ class LayerBatcher:
     def create_batches(self, layers: List[Layer]) -> List[LayerBatch]:
         """Create optimal layer batches from the input layers.
         
-        This method reorganizes layers to batch same-tool layers together,
-        minimizing tool changes while ensuring no collisions when printing.
+        For multi-object prints where the parser creates alternating "layers":
+        - indices 0,2,4,6... = Object 1 (Tool 1)
+        - indices 1,3,5,7... = Object 2 (Tool 0)
         
-        Strategy: Group layers by tool, then alternate between tools in batches,
-        printing multiple layers of one material before switching.
+        We want to batch real layers together, e.g.:
+        - Batch 1: Object 1, actual layers 1-5 (indices 0,2,4,6,8)
+        - Batch 2: Object 2, actual layers 1-5 (indices 1,3,5,7,9)
+        - Batch 3: Object 1, actual layers 6-10 (indices 10,12,14,16,18)
+        - Batch 4: Object 2, actual layers 6-10 (indices 11,13,15,17,19)
         
         Args:
-            layers: List of all layers in the print
+            layers: List of all parser-generated layers
             
         Returns:
-            List of layer batches (may be reordered for efficiency)
+            List of layer batches (REORDERED for batching efficiency)
         """
         self.batches.clear()
         
@@ -68,97 +72,112 @@ class LayerBatcher:
         # Build geometry map for collision detection
         self.collision_detector.build_geometry_map(layers)
         
-        # Group layers by tool
-        layers_by_tool = {}
-        for layer in layers:
-            tool = layer.tool if layer.tool is not None else 0
-            if tool not in layers_by_tool:
-                layers_by_tool[tool] = []
-            layers_by_tool[tool].append(layer)
+        # Detect pattern: check if layers alternate tools consistently
+        tools = [l.tool if l.tool is not None else 0 for l in layers]
+        is_alternating = all(tools[i] != tools[i+1] for i in range(min(10, len(tools)-1)))
         
-        # Sort each tool's layers by layer number to maintain order
-        for tool in layers_by_tool:
-            layers_by_tool[tool].sort(key=lambda l: l.layer_number)
+        if is_alternating and len(set(tools)) == 2:
+            # Multi-object alternating pattern detected
+            return self._create_interleaved_object_batches(layers, tools)
+        else:
+            # Simple sequential batching
+            return self._create_sequential_batches(layers)
+    
+    def _create_interleaved_object_batches(self, layers: List[Layer], tools: List[int]) -> List[LayerBatch]:
+        """Create batches for interleaved multi-object prints.
         
-        # Process layers by alternating between tools in batches
-        tools = sorted(layers_by_tool.keys())
-        tool_indices = {tool: 0 for tool in tools}
-        processed_count = 0
-        total_layers = len(layers)
-        
-        current_tool_idx = 0
-        
-        while processed_count < total_layers:
-            # Get current tool
-            current_tool = tools[current_tool_idx % len(tools)]
-            tool_layers = layers_by_tool[current_tool]
-            start_idx = tool_indices[current_tool]
+        Args:
+            layers: All parser layers
+            tools: Tool for each layer
             
-            if start_idx >= len(tool_layers):
-                # This tool is exhausted, try next
-                current_tool_idx += 1
-                if current_tool_idx >= len(tools) * 2:  # Prevent infinite loop
-                    break
-                continue
-            
-            # Collect a batch of layers for this tool
-            batch_layers = []
-            max_z_diff = 2.0  # Maximum Z height spread in a batch
-            
-            for i in range(start_idx, min(start_idx + self.max_batch_layers, len(tool_layers))):
-                candidate_layer = tool_layers[i]
+        Returns:
+            Reorganized batches
+        """
+        # Separate into two streams (even and odd indices)
+        tool_0_layers = [layers[i] for i in range(len(layers)) if tools[i] == min(tools)]
+        tool_1_layers = [layers[i] for i in range(len(layers)) if tools[i] == max(tools)]
+        
+        # Get the tool numbers
+        tool_0 = min(tools)
+        tool_1 = max(tools)
+        
+        # Create alternating batches
+        idx_0 = 0
+        idx_1 = 0
+        
+        while idx_0 < len(tool_0_layers) or idx_1 < len(tool_1_layers):
+            # Batch for tool_0
+            if idx_0 < len(tool_0_layers):
+                end_idx = min(idx_0 + self.max_batch_layers, len(tool_0_layers))
+                batch_layers = tool_0_layers[idx_0:end_idx]
                 
-                # Check Z height constraint
                 if batch_layers:
-                    z_diff = abs(candidate_layer.z_height - batch_layers[0].z_height)
-                    if z_diff > max_z_diff:
-                        break
+                    batch = LayerBatch(
+                        tool=tool_0,
+                        start_layer=batch_layers[0].layer_number,
+                        end_layer=batch_layers[-1].layer_number,
+                        layers=batch_layers
+                    )
+                    self.batches.append(batch)
+                    idx_0 = end_idx
+            
+            # Batch for tool_1
+            if idx_1 < len(tool_1_layers):
+                end_idx = min(idx_1 + self.max_batch_layers, len(tool_1_layers))
+                batch_layers = tool_1_layers[idx_1:end_idx]
                 
-                # Check if we can safely batch this layer
-                # (simplified: just check Z proximity for multi-material prints)
                 if batch_layers:
-                    # Verify no extreme collision risk
-                    if not self._simple_collision_check(batch_layers[0], candidate_layer):
-                        break
-                
-                batch_layers.append(candidate_layer)
-            
-            if batch_layers:
-                # Create batch
-                batch = LayerBatch(
-                    tool=current_tool,
-                    start_layer=batch_layers[0].layer_number,
-                    end_layer=batch_layers[-1].layer_number,
-                    layers=batch_layers
-                )
-                self.batches.append(batch)
-                
-                # Update indices
-                tool_indices[current_tool] = start_idx + len(batch_layers)
-                processed_count += len(batch_layers)
-            else:
-                # Skip this layer if we can't batch it
-                tool_indices[current_tool] = start_idx + 1
-                processed_count += 1
-            
-            # Alternate to next tool
-            current_tool_idx += 1
+                    batch = LayerBatch(
+                        tool=tool_1,
+                        start_layer=batch_layers[0].layer_number,
+                        end_layer=batch_layers[-1].layer_number,
+                        layers=batch_layers
+                    )
+                    self.batches.append(batch)
+                    idx_1 = end_idx
         
         return self.batches
     
-    def _simple_collision_check(self, layer1: Layer, layer2: Layer) -> bool:
-        """Simple collision check based on Z height and geometry bounds.
+    def _create_sequential_batches(self, layers: List[Layer]) -> List[LayerBatch]:
+        """Create batches for sequential same-tool layers."""
+        current_batch_layers = []
+        current_tool = None
         
-        Args:
-            layer1: First layer
-            layer2: Second layer
+        for layer in layers:
+            layer_tool = layer.tool if layer.tool is not None else 0
             
-        Returns:
-            True if layers can be safely batched
-        """
-        # For multi-material prints, allow batching if layers are close in Z
-        z_diff = abs(layer2.z_height - layer1.z_height)
-        return z_diff <= 2.0  # Within 2mm is generally safe for multi-material
+            should_start_new_batch = False
+            
+            if current_tool is None:
+                current_tool = layer_tool
+            elif current_tool != layer_tool:
+                should_start_new_batch = True
+            elif len(current_batch_layers) >= self.max_batch_layers:
+                should_start_new_batch = True
+            
+            if should_start_new_batch and current_batch_layers:
+                batch = LayerBatch(
+                    tool=current_tool,
+                    start_layer=current_batch_layers[0].layer_number,
+                    end_layer=current_batch_layers[-1].layer_number,
+                    layers=current_batch_layers
+                )
+                self.batches.append(batch)
+                current_batch_layers = []
+                current_tool = layer_tool
+            
+            current_batch_layers.append(layer)
+        
+        if current_batch_layers:
+            batch = LayerBatch(
+                tool=current_tool,
+                start_layer=current_batch_layers[0].layer_number,
+                end_layer=current_batch_layers[-1].layer_number,
+                layers=current_batch_layers
+            )
+            self.batches.append(batch)
+        
+        return self.batches
     
     def get_batch_statistics(self) -> dict:
         """Return statistics about the batching results."""
@@ -166,14 +185,12 @@ class LayerBatcher:
             return {}
         
         total_layers = sum(batch.layer_count() for batch in self.batches)
-        tool_changes = len(self.batches) - 1  # Transitions between batches
+        tool_changes = len(self.batches) - 1
         
-        # Count batches per tool
         tool_batch_count = {}
         for batch in self.batches:
             tool_batch_count[batch.tool] = tool_batch_count.get(batch.tool, 0) + 1
         
-        # Find largest batch
         max_batch_size = max(batch.layer_count() for batch in self.batches)
         
         return {
